@@ -10,6 +10,7 @@ import string
 import numpy as np
 
 import llm
+import models
 
 def setup_logging():
     """Set up logging configuration."""
@@ -279,8 +280,12 @@ def choose_provider(args):
     try:
         config = llm.resolve_config(args.llm, args.model, args.base_url, args.api_key_env)
         if config is None:
+            if args.llm == 'auto' and not args.offline and sys.stdin.isatty():
+                if models.first_run_offer():
+                    sys.exit(0)   # model downloaded; the user must start the server, then re-run
             logging.warning("No local LLM server found (tried ollama, llamacpp, lmstudio). "
-                            "Continuing with keyphrases only; start one or pass --llm.")
+                            "Continuing with keyphrases only. List vetted local models with: "
+                            "python3 texturr.py models")
             return None
         llm.check_policy(config, args.allow_remote, args.offline)
     except llm.LLMError as e:
@@ -293,6 +298,8 @@ def choose_provider(args):
     return config
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == 'models':
+        sys.exit(models.cli(sys.argv[2:]))
     setup_logging()
     args = parse_arguments()
     if args.offline:

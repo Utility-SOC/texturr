@@ -48,6 +48,55 @@ python3 texturr.py survey.xlsx --sheet "Q3 Results" --column Comments --clusters
 | `--embedding-model` | Sentence-transformers model name or local directory (default `all-MiniLM-L6-v2`). |
 | `--sample-size` | Responses per cluster shown to the LLM (default 8). |
 
+## Picking a local model (`models`)
+
+No local model yet? texturr builds a live shortlist from the Hugging Face Hub:
+
+```bash
+python3 texturr.py models            # show the top 5 vetted models
+python3 texturr.py models --pull 1   # download #1 (asks first)
+```
+
+The first interactive run with no local server found offers the same list. Nothing
+is downloaded without an explicit yes.
+
+**Why not a leaderboard?** No maintained Hugging Face leaderboard covers
+summarization (the Open LLM Leaderboard was frozen in March 2025), so the list
+comes from live Hub data (downloads, licenses, sizes, commit SHAs), ranked by
+30-day downloads. That measures adoption, not quality. The vetting rules are what
+make a candidate defensible, and they are all applied in code you can read
+(`models.py`):
+
+- **Publisher allowlist**, first-party GGUF repos only (no third-party re-quants):
+  `ibm-granite`, `microsoft`, `mistralai`, `allenai`, `HuggingFaceTB`, `openai`, `nvidia`.
+  Override with `--orgs`. Chinese-origin publishers (Qwen, DeepSeek) are left off
+  by default because many government procurement policies restrict them; add them
+  if your policy allows.
+- **Provenance:** a model must also be derived only from base models by allowlisted
+  publishers, so a fine-tune of someone else's model cannot ride in on an allowed name.
+- **Permissive license only:** Apache-2.0 or MIT (`--licenses`). Custom community
+  licenses (Llama, Gemma) are excluded.
+- **Text chat models of known size,** at most 14B parameters (`--max-params-b`),
+  updated within 18 months (`--max-age-days`), base-only models excluded, and at
+  most two per publisher so one vendor cannot fill the list.
+- **Pinned and verified download:** the file is fetched at an exact commit SHA
+  (never `main`), its SHA-256 is checked against the hash the Hub records, a
+  mismatch deletes the file, and a `.provenance.json` (repo, revision, hash,
+  license, source URL, timestamp) is written next to it. Files go under
+  `~/.cache/texturr/models` (set `TEXTURR_HOME` to move them). Sharded GGUFs are
+  refused for now.
+
+After a download, run the model with llama.cpp and texturr finds it automatically:
+
+```bash
+llama-server -m <path printed by texturr> --jinja --port 8080
+python3 texturr.py survey.xlsx --column Comments
+```
+
+The Hub is contacted only for the list and the download, and never when `--offline`
+is set. In an air-gapped environment, download on a connected machine and carry the
+file and its `.provenance.json` across.
+
 ## Privacy model
 
 - **Local by default.** Providers on `localhost` are local; everything else is
@@ -61,9 +110,9 @@ python3 texturr.py survey.xlsx --sheet "Q3 Results" --column Comments --clusters
 - **Air-gapped use:** pre-download the embedding model, point `--embedding-model`
   at its directory, and pass `--offline`. That blocks Hugging Face downloads and
   refuses remote providers.
-- **Responses are treated as untrusted.** They are fenced in the prompt with an
-  instruction not to follow anything inside them, and model replies are parsed
-  strictly.
+- **Responses are fenced as untrusted data.** They are wrapped in `<answers>` tags
+  in the prompt with an instruction never to follow anything inside them, and model
+  replies are parsed strictly (a reply that is not the expected JSON is discarded).
 - **The output CSV contains verbatim responses.** Handle it at the same
   classification as the input. Cells starting with `=`, `+`, `-`, `@` are
   prefixed with `'` so opening the CSV in Excel cannot run formulas.
@@ -95,9 +144,17 @@ the group's center), and `Responses` (1-based positions of the answers in the gr
 python3 -m pytest
 ```
 
-The tests use a stub local HTTP server, so they need no model or network.
+The tests use stub local HTTP servers, so they need no model, no Hugging Face
+account and no network.
 
 ## Changelog
+
+- **Vetted model shortlist and verified download**: `python3 texturr.py models`
+  lists the top 5 vetted local models from the live Hub, and `--pull N` (also
+  offered on first run) downloads one pinned to a commit SHA with SHA-256
+  verification and a provenance record. Vetting rules: publisher allowlist, base-model
+  provenance, permissive license, size and recency limits. Replaces the idea of a
+  leaderboard-driven list, since the HF leaderboard is frozen and not about summarization.
 
 - **Local-first LLM labeling**: new `llm.py` supports local servers (Ollama,
   llama.cpp, LM Studio, any OpenAI-compatible endpoint) and hosted providers
@@ -119,5 +176,7 @@ The tests use a stub local HTTP server, so they need no model or network.
 
 This is an early prototype. Planned: automatic choice of cluster count, an
 evaluation on a public labeled dataset, CI, and a shareable HTML report. The
-LLM path has been tested against a stub server but not yet against a real model.
+LLM path has been tested against stub servers but not yet against a real model, and
+the downloader has been checked against the live Hub's metadata but has not yet
+downloaded a real model.
 This README is updated with every change.
