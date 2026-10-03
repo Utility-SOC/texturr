@@ -5,30 +5,38 @@ import pandas as pd
 import logging
 import sys
 import string
-from tqdm import tqdm
-from sklearn.cluster import KMeans
-from sentence_transformers import SentenceTransformer
-from transformers import pipeline
-from keybert import KeyBERT
 
 def setup_logging():
     """Set up logging configuration."""
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
-def parse_arguments():
+def parse_arguments(argv=None):
     """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(description='Perform textual analysis on a column or row in an Excel spreadsheet.')
+    parser = argparse.ArgumentParser(description='Group and summarize free-form answers in an Excel spreadsheet.')
     parser.add_argument('filename', type=str, help='Excel file name (xlsx format)')
-    args = parser.parse_args()
-    return args
+    parser.add_argument('--sheet', help='Sheet name or 1-based number (prompts if omitted and there are several)')
+    parser.add_argument('--column', help='Column to group: a letter (C) or a header name ("Comments"). Prompts if omitted.')
+    parser.add_argument('--row', type=int, help='Group the answers in this 1-based row instead of a column')
+    parser.add_argument('--header-row', type=int, default=1,
+                        help='1-based row holding column headers (default 1, 0 = no header row)')
+    parser.add_argument('--clusters', type=int, default=5, help='Number of groups (default 5)')
+    parser.add_argument('--output', default='summary_output.csv', help='Output CSV (default summary_output.csv)')
+    return parser.parse_args(argv)
 
-def list_sheets(filename):
+def list_sheets(filename, requested=None):
     """List all sheets in the Excel workbook and allow user to select one."""
     try:
         xl = pd.ExcelFile(filename)
         sheet_names = xl.sheet_names
         if not sheet_names:
             logging.error("No sheets found in the Excel file.")
+            sys.exit(1)
+        if requested is not None:
+            if requested in sheet_names:
+                return requested
+            if requested.isdigit() and 1 <= int(requested) <= len(sheet_names):
+                return sheet_names[int(requested) - 1]
+            logging.error(f"Sheet '{requested}' not found. Available: {', '.join(sheet_names)}")
             sys.exit(1)
         elif len(sheet_names) == 1:
             logging.info(f"Only one sheet found: '{sheet_names[0]}'. Loading it automatically.")
@@ -52,36 +60,69 @@ def list_sheets(filename):
         logging.error(f"Error reading Excel file: {e}")
         sys.exit(1)
 
-def get_row_or_column(df):
-    """Prompt the user to enter a row number or column letter."""
+def column_labels(df, header_row):
+    """Map column letter -> header text (or the letter itself when there is no header)."""
+    labels = {}
+    for i in range(df.shape[1]):
+        letter = index_to_column_letter(i)
+        text = ''
+        if header_row and header_row <= len(df) and pd.notna(df.iat[header_row - 1, i]):
+            text = str(df.iat[header_row - 1, i]).strip()
+        labels[letter] = text or letter
+    return labels
+
+def resolve_column(value, labels):
+    """Resolve a letter or header name to a column letter, or None if no match."""
+    if value.upper() in labels and value.isalpha():
+        return value.upper()
+    matches = [k for k, v in labels.items() if v.lower() == value.lower()]
+    return matches[0] if len(matches) == 1 else None
+
+def show_columns(df, labels, header_row):
+    print("Columns:")
+    for letter, label in labels.items():
+        col = df.iloc[header_row:, column_letter_to_index(letter)].dropna()
+        sample = str(col.iloc[0])[:40] if len(col) else ''
+        print(f"  {letter:>3}  {label[:30]:<30}  {len(col):>5} answers  e.g. {sample!r}")
+
+def get_row_or_column(df, header_row=1, column=None, row=None):
+    """Return ('column', letter) or ('row', number), from flags or an interactive prompt."""
+    labels = column_labels(df, header_row)
+    if row is not None:
+        if not 1 <= row <= len(df):
+            logging.error(f"Row {row} is out of range (1-{len(df)}).")
+            sys.exit(1)
+        return 'row', row
+    if column is not None:
+        letter = resolve_column(column, labels)
+        if letter is None:
+            logging.error(f"Column '{column}' not found. Available: {get_available_columns(df, labels)}")
+            sys.exit(1)
+        logging.info(f"Selected column {letter} ('{labels[letter]}')")
+        return 'column', letter
+    show_columns(df, labels, header_row)
     while True:
         try:
-            selection = input("Enter the row number or column letter of interest: ").strip()
-            if selection.isdigit():
-                row_num = int(selection)
-                if 1 <= row_num <= len(df):
-                    logging.info(f"Selected row: {row_num}")
-                    return 'row', row_num
-                else:
-                    print(f"Please enter a row number between 1 and {len(df)}.")
-            elif selection.isalpha():
-                column_letter = selection.upper()
-                col_index = column_letter_to_index(column_letter)
-                if col_index >= df.shape[1]:
-                    print(f"Column '{column_letter}' does not exist. Available columns: {get_available_columns(df)}")
-                    continue
-                logging.info(f"Selected column: '{column_letter}'")
-                return 'column', column_letter
-            else:
-                print("Invalid input. Please enter a row number or column letter.")
+            selection = input("Column to group (letter or header name), or 'row N': ").strip()
         except EOFError:
             print("\nNo input detected. Exiting the program.")
             sys.exit(1)
+        if selection.lower().startswith('row '):
+            num = selection[4:].strip()
+            if num.isdigit() and 1 <= int(num) <= len(df):
+                return 'row', int(num)
+            print(f"Please enter a row number between 1 and {len(df)}.")
+            continue
+        letter = resolve_column(selection, labels)
+        if letter:
+            logging.info(f"Selected column {letter} ('{labels[letter]}')")
+            return 'column', letter
+        print("No such column. Try a letter, a header name, or 'row N'.")
 
-def get_available_columns(df):
-    num_cols = df.shape[1]
-    letters = [index_to_column_letter(i) for i in range(num_cols)]
-    return ', '.join(letters)
+def get_available_columns(df, labels=None):
+    if labels:
+        return ', '.join(f"{k} ({v})" if v != k else k for k, v in labels.items())
+    return ', '.join(index_to_column_letter(i) for i in range(df.shape[1]))
 
 def column_letter_to_index(letter):
     letter = letter.upper()
@@ -102,14 +143,14 @@ def index_to_column_letter(index):
         result = chr(65 + remainder) + result
     return result
 
-def load_data(filename, sheet_name, selection_type, selection_value):
+def load_data(filename, sheet_name, selection_type, selection_value, header_row=1):
     try:
         df = pd.read_excel(filename, sheet_name=sheet_name, header=None)
         if selection_type == 'column':
             col_index = column_letter_to_index(selection_value)
             if col_index >= df.shape[1]:
                 raise ValueError(f"Column '{selection_value}' does not exist in the spreadsheet.")
-            data_series = df.iloc[:, col_index].dropna().astype(str)
+            data_series = df.iloc[header_row:, col_index].dropna().astype(str)
         elif selection_type == 'row':
             row_index = selection_value - 1
             if not 0 <= row_index < len(df):
@@ -125,6 +166,7 @@ def load_data(filename, sheet_name, selection_type, selection_value):
 
 def compute_embeddings(data):
     try:
+        from sentence_transformers import SentenceTransformer
         model = SentenceTransformer('all-MiniLM-L6-v2')
         embeddings = model.encode(data, show_progress_bar=True)
         return embeddings
@@ -134,6 +176,8 @@ def compute_embeddings(data):
 
 def cluster_embeddings(embeddings, n_clusters):
     try:
+        from tqdm import tqdm
+        from sklearn.cluster import KMeans
         clustering_model = KMeans(n_clusters=n_clusters, random_state=42)
         with tqdm(total=1, desc="Clustering embeddings") as pbar:
             cluster_assignment = clustering_model.fit_predict(embeddings)
@@ -145,6 +189,7 @@ def cluster_embeddings(embeddings, n_clusters):
 
 def extract_keyphrases(data, clusters):
     try:
+        from keybert import KeyBERT
         kw_model = KeyBERT()
         cluster_keyphrases = {}
 
@@ -161,6 +206,7 @@ def extract_keyphrases(data, clusters):
 
 def generate_actionable_summary(cluster_texts):
     try:
+        from transformers import pipeline
         summarizer = pipeline('summarization', model='facebook/bart-large-cnn')
         actionable_summaries = []
 
@@ -209,24 +255,23 @@ def save_results_to_csv(data, clusters, keyphrases, output_filename='summary_out
 def main():
     setup_logging()
     args = parse_arguments()
-    filename = args.filename
 
-    sheet_name = list_sheets(filename)
-    df = pd.read_excel(filename, sheet_name=sheet_name, header=None)
-    selection_type, selection_value = get_row_or_column(df)
-    data = load_data(filename, sheet_name, selection_type, selection_value)
+    sheet_name = list_sheets(args.filename, args.sheet)
+    df = pd.read_excel(args.filename, sheet_name=sheet_name, header=None)
+    selection_type, selection_value = get_row_or_column(df, args.header_row, args.column, args.row)
+    data = load_data(args.filename, sheet_name, selection_type, selection_value, args.header_row)
 
     logging.info("Computing embeddings...")
     embeddings = compute_embeddings(data)
 
-    n_clusters = min(len(data), 5)
+    n_clusters = max(1, min(len(data), args.clusters))
     logging.info("Clustering embeddings...")
     clusters = cluster_embeddings(embeddings, n_clusters)
 
     logging.info("Extracting keyphrases for each cluster...")
     keyphrases = extract_keyphrases(data, clusters)
 
-    save_results_to_csv(data, clusters, keyphrases)
+    save_results_to_csv(data, clusters, keyphrases, args.output)
 
 if __name__ == '__main__':
     main()
