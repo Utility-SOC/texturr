@@ -18,7 +18,7 @@ dev = ["pytest", "datasets"]
 texturr = "texturr:main"
 
 [tool.setuptools]
-py-modules = ["texturr", "llm", "models", "clustering", "report"]
+py-modules = ["texturr", "llm", "models", "clustering", "clean", "report", "session", "server"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

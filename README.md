@@ -46,6 +46,7 @@ python3 texturr.py survey.xlsx --sheet "Q3 Results" --column Likes Dislikes \
 | `--sheet` | Sheet name or 1-based number (Excel only). Prompts if omitted and the workbook has several. |
 | `--header-row N` | Row holding column headers (default `1`; `0` means no header row). Headers name the columns and are excluded from the answers. |
 | `--clusters` | `auto` (default) picks the group count by silhouette score (2 to 12), or give a number. |
+| `--keep-nonanswers` | Cluster "N/A", "none", "idk" and similar too. By default they are set aside as one group (cluster `-1`). |
 | `--output` | Summary CSV path (default `summary_output.csv`). |
 | `--html PATH` | Also write a self-contained HTML report (no scripts, no external assets, works air-gapped). |
 | `--annotated PATH` | Also write a copy of the input with `<column> Cluster` and `<column> Theme` columns added beside the data (column analysis only). |
@@ -63,7 +64,10 @@ python3 texturr.py survey.xlsx --sheet "Q3 Results" --column Likes Dislikes \
 **Summary CSV**, one row per group: `Column`, `Cluster`, `Size`, `Label` (LLM theme
 name), `Summary`, `Suggested Action`, `Keyphrases`, `Representative Responses` (the
 three closest to the group's center) and `Responses` (1-based positions of the answers
-in the group). `Label`, `Summary` and `Suggested Action` are empty when no LLM is used.
+in the group). `Label`, `Summary` and `Suggested Action` are empty when no LLM is used. Blank or boilerplate
+answers ("N/A", "none", "idk", symbols only) form their own group with cluster `-1`, labeled
+"Non-answers", instead of distorting the real groups. Only genuinely empty cells are treated as
+missing; the literal text "N/A" is kept and counted (pandas would otherwise drop it silently).
 
 **HTML report:** one card per group, largest first, with a size bar, summary, suggested
 action, keyphrases and representative quotes. Every value is HTML-escaped, the page
@@ -74,6 +78,30 @@ or dark theme.
 columns per analyzed column. Without an LLM the theme falls back to the top keyphrases.
 New headers go on the header row; with `--header-row 0` they are omitted rather than
 overwrite your data.
+
+## Agentic mode: an AI agent that refines the grouping (n8n)
+
+Automatic grouping tends to split one theme into several groups, and no statistic fixes that (see
+[Evaluation](#evaluation)). So texturr can run as a local service that an AI agent drives:
+
+```bash
+cp .env.example .env && docker compose up -d --build && ./n8n/bootstrap.sh
+```
+
+The agent, built as an n8n workflow, reads the groups, merges those that mean the same thing,
+splits mixed ones, moves misplaced answers, labels every group from what it read, and returns your
+spreadsheet with a `Cluster` and `Theme` column beside each answer. Two workflows ship: an upload
+form for people and a file-based one for batch use. Everything runs on your machine with a local
+model by default. Full setup, security notes and what was and was not tested: **[n8n/README.md](n8n/README.md)**.
+
+The service (`python3 texturr.py serve`) is useful on its own: REST endpoints to create a session from
+a list of answers or an uploaded file and download the report (`json`, `csv`, `html`, or an
+annotated copy of the upload), plus an MCP endpoint (`/mcp`) exposing `get_overview`,
+`get_cluster_examples`, `merge_clusters`, `split_cluster`, `move_responses`, `set_cluster_label` and
+`finish_analysis`, so any MCP client can use it. It binds loopback by default, requires a bearer
+token, keeps sessions in memory only (nothing on disk), expires them, caps request sizes, rejects
+zip bombs, and never logs request bodies or response text. Every merge, split, move and label is kept in the session
+history, which is returned with the JSON report as an audit trail.
 
 ## Picking a local model (`models`)
 
@@ -179,12 +207,36 @@ knowing the answer in advance. Limits to know about:
   obvious themes and auto picks 7. I tried a "prefer fewer groups" rule; it fixed that
   example but lowered accuracy on the benchmark (ARI 0.83 to 0.74), so it is not used.
   Pass `--clusters N` when you know roughly how many themes to expect.
-- This evaluates grouping only. It does **not** evaluate the LLM-written labels,
-  summaries or suggested actions, which needs a model and a human or LLM judge. That
-  is the main untested piece.
+- This table evaluates grouping only. Labels are evaluated separately below.
 - Banking77 queries are short and clean; real survey text is messier.
 
 Reproduce: `pip install datasets && python eval/run_eval.py --trials 10 --intents 8`.
+
+**Choosing the group count: what did not work.** I tried to fix over-splitting with statistics,
+on held-out trials at four set sizes (4x6, 5x12, 8x30 and 12x60 responses): Davies-Bouldin, agglomerative
+clustering with a distance threshold, and merging groups whose centers are similar after
+silhouette. Plain silhouette won or tied at every size. Merging by center similarity changed
+nothing at any threshold that did not also hurt accuracy, and the other two were worse (for example
+agglomerative missed the true count by 16 to 25 groups on the larger sets). What remains is
+semantic over-splitting that only reading the responses can fix, which is the case for the
+[agentic mode](#agentic-mode-an-ai-agent-that-refines-the-grouping-n8n).
+
+**Label quality.** `eval/label_eval.py` takes groups whose true intent is known and checks whether the
+generated label is closer, by embedding, to its own intent than to any other intent in the trial
+(top-1), using the true groups so label quality is not confounded with grouping quality. Today's
+numbers are for the no-LLM baseline; the same command scores any model
+(`--provider ollama --model llama3.1`).
+
+| Labels (10 trials x 8 intents) | top-1 | similarity to own intent |
+|---|---|---|
+| keyphrases only (no LLM) | 0.84 ± 0.10 | 0.61 ± 0.06 |
+| shuffled labels (floor) | 0.20 ± 0.17 | 0.37 ± 0.16 |
+| the true intent text (ceiling) | 1.00 | 1.00 |
+
+**An LLM has not yet been scored.** The harness is validated (it separates correct from shuffled
+labels) but no real model has run through it, so the claim that LLM labels beat keyphrases is
+unproven here. The metric also measures identification, not fluency or usefulness of the summary
+and suggested action, which still need a human read.
 
 ## Tests
 
@@ -192,12 +244,21 @@ Reproduce: `pip install datasets && python eval/run_eval.py --trials 10 --intent
 python3 -m pytest
 ```
 
-The suite uses stub local HTTP servers, so it needs no model, no Hugging Face account
-and no network. One end-to-end test runs the real embedding and keyphrase stack and
-skips itself when `sentence-transformers` is not installed. GitHub Actions runs the
-suite on Python 3.9 to 3.12.
+The suite (83 tests) uses stub local HTTP servers, so it needs no model, no Hugging Face
+account and no network. It covers the provider policy, model vetting and downloads, the session
+logic and its guardrails, the REST and MCP server (auth, limits, uploads, error handling), the
+generated n8n workflows (valid connections, no secrets, in sync with the server's tool list) and
+the scripted test LLM. One end-to-end test runs the real embedding and keyphrase stack and skips
+itself when `sentence-transformers` is not installed. GitHub Actions runs the suite on Python 3.9 to 3.12.
 
 ## Changelog
+
+- **Agentic mode and limit fixes**: `texturr.py serve` (REST + MCP, in-memory sessions, token auth);
+  an n8n AI Agent workflow (upload form and file-based) that merges, splits, moves and labels groups;
+  Docker image and compose stack with execution-data retention disabled; `move_responses`;
+  non-answers ("N/A", "none") set aside as their own group; fixed pandas silently dropping the text
+  "N/A"/"None"/"NA" when reading files; label-quality harness with a measured baseline; documented
+  negative results on group-count selection. **Change:** with default settings, non-answers now appear as cluster `-1`.
 
 - **Features batch**: automatic group count (silhouette); several columns in one run;
   CSV/TSV input; `--html` shareable report; `--annotated` copy of the input with
@@ -221,13 +282,18 @@ suite on Python 3.9 to 3.12.
 
 ## Status and plans
 
-Early but working. The whole pipeline (embed, group, keyphrases, HTML, annotated copy)
-has been run end to end on real embeddings, and the grouping is evaluated above. **Not
-yet verified:** the LLM labeling path against a real model (it is tested against stub
-servers only), and a real model download (the downloader is tested against a stub
-server and checked against the live Hub's metadata). Hosted-provider default model
-names come from memory and should be checked against current provider docs.
+Working and tested end to end with real components: the pipeline (embeddings, grouping, keyphrases,
+HTML, annotated copy), the grouping evaluation, the service with real embeddings, and both n8n
+workflows running in real n8n 2.41.6 with the real AI Agent and MCP nodes.
 
-Not built: Ollama import of downloaded files, an LLM-label quality evaluation, outlier
-handling in the group count, and installing llama.cpp for you. This README is updated
-with every change.
+**Not yet verified, and the honest list of what is unproven:**
+- **Any real LLM.** The labeling path is tested against stub servers, and the n8n agent against a
+  scripted stand-in that follows a fixed plan. That proves the wiring, not that a model makes good
+  merge decisions or labels. This is the main gap; the harnesses to measure it exist.
+- **A real model download.** The downloader is tested against a stub server and the Hub's live metadata.
+- Hosted-provider default model names come from memory and should be checked against provider docs.
+- Auto k is still approximate (see Evaluation); the agent is the intended fix, but that is untested with a real model.
+
+Not built: Ollama import of downloaded files, outlier detection beyond non-answers, installing
+llama.cpp for you, and multi-column analysis in the service (the CLI supports it). This README is
+updated with every change.

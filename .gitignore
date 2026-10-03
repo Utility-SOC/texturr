@@ -2,3 +2,11 @@
 __pycache__/
 *.egg-info/
 summary_output.*
+.env
+n8n/data/*
+!n8n/data/in/
+!n8n/data/out/
+n8n/data/in/*
+n8n/data/out/*
+!n8n/data/in/.gitkeep
+!n8n/data/out/.gitkeep

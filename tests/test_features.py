@@ -3,6 +3,7 @@ import pandas as pd
 import pytest
 from openpyxl import Workbook, load_workbook
 
+import clean
 import clustering
 import report
 import texturr
@@ -157,3 +158,54 @@ def test_end_to_end_pipeline(tmp_path):
     groups = sorted(sorted(i for i, c in enumerate(clusters) if c == k) for k in set(clusters))
     assert groups == [[0, 1, 2], [3, 4, 5], [6, 7, 8]]
     assert all(r['Keyphrases'] for r in out)
+
+
+# --- non-answers ---------------------------------------------------------------------------
+
+def test_nonanswer_detection():
+    for t in ['N/A', ' none ', 'n/a.', '...', '???', 'No comment', "I don\u2019t know", 'idk!', '   ', '-']:
+        assert clean.is_nonanswer(t), t
+    for t in ['no', 'The app is great', 'None of the buttons work', 'nothing works since the update', 'a']:
+        assert not clean.is_nonanswer(t), t
+
+
+def test_analyze_sets_aside_nonanswers_and_keeps_original_numbering(monkeypatch):
+    emb = {'slow': [10, 0], 'slower': [10, 1], 'crash': [10, 0.5], 'nice': [0, 10], 'pretty': [1, 10], 'clean': [0.5, 10], 'N/A': [5, 5], 'none': [5, 5.5]}
+    monkeypatch.setattr(texturr, 'compute_embeddings', lambda data, m: np.array([emb[t] for t in data], dtype=float))
+    monkeypatch.setattr(texturr, 'extract_keyphrases', lambda d, c, m: {})
+    args = texturr.parse_arguments(['f.csv', '--llm', 'none', '--clusters', '2'])
+    data = ['slow', 'N/A', 'slower', 'nice', 'none', 'pretty', 'crash', 'clean']
+    rows, clusters = texturr.analyze(data, args, None)
+    assert list(clusters[[1, 4]]) == [-1, -1] and set(clusters[[0, 2, 6]]) != set(clusters[[3, 5, 7]])
+    na = [r for r in rows if r['Cluster'] == -1][0]
+    assert na['Label'] == 'Non-answers' and na['Responses'] == '2, 5'
+    real = sorted(r['Responses'] for r in rows if r['Cluster'] != -1)
+    assert real == ['1, 3, 7', '4, 6, 8']                 # numbers refer to the original rows, not the filtered list
+    kept = texturr.analyze(data, texturr.parse_arguments(['f.csv', '--llm', 'none', '--clusters', '2', '--keep-nonanswers']), None)[1]
+    assert -1 not in set(kept)
+
+
+def test_literal_na_text_survives_reading_but_empty_cells_do_not(tmp_path):
+    for name, writer in (('a.xlsx', lambda p: make_xlsx(p, [['Comments'], ['N/A'], ['None'], [None], ['real answer'], ['NA']])),
+                         ('a.csv', lambda p: open(p, 'w').write('Comments\nN/A\nNone\n\nreal answer\nNA\n'))):
+        p = str(tmp_path / name)
+        writer(p)
+        data, _ = texturr.extract_answers(texturr.read_frame(p, None), 'column', 'A', 1)
+        assert data == ['N/A', 'None', 'real answer', 'NA'], name
+
+
+# --- label evaluation harness -----------------------------------------------------------------------
+
+def test_label_eval_scoring_separates_good_from_bad_labels():
+    import sys
+    sys.path.insert(0, 'eval')
+    import label_eval
+    vocab = {'card arrival': [1, 0, 0], 'lost card': [0, 1, 0], 'exchange rate': [0, 0, 1],
+             'where is my card': [.9, .1, 0], 'card stolen': [.1, .9, 0], 'fx question': [0, .1, .9]}
+    embed = lambda xs: np.array([vocab[x] for x in xs], dtype=float)
+    intents = ['card_arrival', 'lost_card', 'exchange_rate']
+    top1, sim = label_eval.score(['where is my card', 'card stolen', 'fx question'], intents, embed)
+    assert top1 == 1.0 and sim > 0.9
+    top1, sim = label_eval.score(['card stolen', 'fx question', 'where is my card'], intents, embed)   # shuffled
+    assert top1 == 0.0 and sim < 0.2
+    assert label_eval.humanize('card_arrival-time') == 'card arrival time'

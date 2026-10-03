@@ -92,9 +92,10 @@ def annotate_workbook(source, sheet, annotations, output, header_row=1):
     wb.save(output)
 
 
-def annotate_csv(source, annotations, output, csv_safe, header_row=1):
-    """CSV/TSV equivalent: appends cluster and theme columns to the input rows."""
-    sep = '\t' if source.lower().endswith(('.tsv', '.tab')) else ','
+def annotate_csv(source, annotations, output, csv_safe, header_row=1, filename=None):
+    """CSV/TSV equivalent: appends cluster and theme columns to the input rows.
+    `source`/`output` may be paths or file-like objects; pass `filename` when they are file-like."""
+    sep = '\t' if (filename or str(source)).lower().endswith(('.tsv', '.tab')) else ','
     df = pd.read_csv(source, header=None, sep=sep, dtype=str, keep_default_na=False, skip_blank_lines=False)
     for a in annotations:
         cl = [''] * len(df)

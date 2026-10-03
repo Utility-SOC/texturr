@@ -10,6 +10,7 @@ import sys
 import numpy as np
 import pandas as pd
 
+import clean
 import clustering
 import llm
 import models
@@ -36,6 +37,8 @@ def parse_arguments(argv=None):
                         help='1-based row holding column headers (default 1, 0 = no header row)')
     parser.add_argument('--clusters', default='auto',
                         help="Number of groups: 'auto' (default; best silhouette score from 2 to 12) or a number")
+    parser.add_argument('--keep-nonanswers', action='store_true',
+                        help="Cluster 'N/A', 'none', 'idk' and similar too (by default they are set aside as one group)")
     parser.add_argument('--output', default='summary_output.csv', help='Summary CSV (default summary_output.csv)')
     parser.add_argument('--html', metavar='PATH', help='Also write a self-contained HTML report')
     parser.add_argument('--annotated', metavar='PATH',
@@ -67,12 +70,31 @@ def is_table_file(filename):
     return filename.lower().endswith(CSV_SUFFIXES)
 
 
-def read_frame(filename, sheet_name=None):
-    """Read a sheet (or a CSV/TSV file) as raw cells, with no header interpretation."""
+def read_frame(filename, sheet_name=None, source=None):
+    """Read a sheet (or a CSV/TSV file) as raw cells, with no header interpretation.
+
+    `filename` decides the format; `source` may be a file-like object holding the bytes
+    (used by the service so uploads never touch the disk).
+    """
+    src = source if source is not None else filename
     if is_table_file(filename):
         sep = '\t' if filename.lower().endswith(('.tsv', '.tab')) else ','
-        return pd.read_csv(filename, header=None, sep=sep, dtype=str, skip_blank_lines=False)
-    return pd.read_excel(filename, sheet_name=sheet_name if sheet_name is not None else 0, header=None)
+        return pd.read_csv(src, header=None, sep=sep, dtype=str, skip_blank_lines=False,
+                           keep_default_na=False, na_values=[''])
+    # Only truly empty cells are missing: pandas would otherwise turn the text 'N/A', 'None' or 'NA' into NaN
+    return pd.read_excel(src, sheet_name=sheet_name if sheet_name is not None else 0, header=None,
+                         keep_default_na=False, na_values=[''])
+
+
+def pick_sheet(names, requested=None):
+    """Resolve a sheet name or 1-based number against `names`; None means the first sheet."""
+    if requested in (None, ''):
+        return names[0]
+    if requested in names:
+        return requested
+    if str(requested).isdigit() and 1 <= int(requested) <= len(names):
+        return names[int(requested) - 1]
+    raise ValueError(f"Sheet '{requested}' not found. Available: {', '.join(names)}")
 
 
 def list_sheets(filename, requested=None):
@@ -277,7 +299,7 @@ def csv_safe(value):
     return "'" + text if text[:1] in ('=', '+', '-', '@', '\t', '\r') else text
 
 
-def build_report(data, clusters, keyphrases, embeddings, config=None, sample_size=8):
+def build_report(data, clusters, keyphrases, embeddings, config=None, sample_size=8, numbers=None):
     """One row per cluster. With a provider config, rows also get an LLM label/summary/action."""
     rows = []
     for cluster_id in sorted(set(int(c) for c in clusters)):
@@ -298,7 +320,7 @@ def build_report(data, clusters, keyphrases, embeddings, config=None, sample_siz
             'Suggested Action': label['action'],
             'Keyphrases': ', '.join(phrases),
             'Representative Responses': ' | '.join(data[i] for i in reps[:3]),
-            'Responses': ', '.join(str(i + 1) for i in members),
+            'Responses': ', '.join(str((numbers[i] if numbers else i) + 1) for i in members),
         })
     return rows
 
@@ -341,19 +363,40 @@ def choose_provider(args):
 
 
 def analyze(data, args, config):
-    """Embed, cluster and describe one list of answers. Returns (rows, clusters)."""
-    logging.info("Computing embeddings...")
-    embeddings = compute_embeddings(data, args.embedding_model)
-    clusters, k, scores = clustering.cluster(embeddings, args.clusters)
-    if args.clusters == 'auto':
-        logging.info(f"Chose {k} groups automatically" + (f" (silhouette {scores[k]:.2f})" if scores else ""))
-    keyphrases = extract_keyphrases(data, clusters, args.embedding_model)
-    return build_report(data, clusters, keyphrases, embeddings, config, args.sample_size), clusters
+    """Embed, cluster and describe one list of answers. Returns (rows, clusters).
+
+    Boilerplate answers ('N/A', 'none', ...) are set aside as one group with cluster id -1,
+    unless --keep-nonanswers is given.
+    """
+    keep = [i for i, t in enumerate(data) if args.keep_nonanswers or not clean.is_nonanswer(t)]
+    skipped = [i for i in range(len(data)) if i not in set(keep)]
+    sub = [data[i] for i in keep]
+    clusters = np.full(len(data), -1, dtype=int)
+    rows = []
+    if len(sub) >= 1:
+        logging.info("Computing embeddings...")
+        embeddings = compute_embeddings(sub, args.embedding_model)
+        sub_clusters, k, scores = clustering.cluster(embeddings, args.clusters)
+        if args.clusters == 'auto':
+            logging.info(f"Chose {k} groups automatically" + (f" (silhouette {scores[k]:.2f})" if scores else ""))
+        keyphrases = extract_keyphrases(sub, sub_clusters, args.embedding_model)
+        rows = build_report(sub, sub_clusters, keyphrases, embeddings, config, args.sample_size, numbers=keep)
+        clusters[keep] = sub_clusters
+    if skipped:
+        logging.info(f"Set aside {len(skipped)} non-answers (use --keep-nonanswers to cluster them).")
+        rows.append({'Cluster': -1, 'Size': len(skipped), 'Label': 'Non-answers', 'Summary': 'Blank or boilerplate responses.',
+                     'Suggested Action': '', 'Keyphrases': '',
+                     'Representative Responses': ' | '.join(data[i] for i in skipped[:3]),
+                     'Responses': ', '.join(str(i + 1) for i in skipped)})
+    return rows, clusters
 
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == 'models':
         sys.exit(models.cli(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == 'serve':
+        import server
+        sys.exit(server.cli(sys.argv[2:]))
     setup_logging()
     args = parse_arguments()
     if args.offline:

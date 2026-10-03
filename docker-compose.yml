@@ -1,0 +1,55 @@
+# texturr + n8n, local-first.
+#   cp .env.example .env   (set TEXTURR_TOKEN)
+#   docker compose up -d --build
+#   ./n8n/bootstrap.sh     (imports the workflows and creates the credentials)
+# Add a local model server with:  docker compose --profile ollama up -d
+services:
+  texturr:
+    build: .
+    environment:
+      TEXTURR_TOKEN: ${TEXTURR_TOKEN:?Set TEXTURR_TOKEN in .env (at least 16 characters)}
+    # No published ports: only other containers on this compose network (n8n) can reach it.
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:2.41.6
+    depends_on: [texturr]
+    ports:
+      - "127.0.0.1:5678:5678"          # the editor is reachable from this machine only
+    environment:
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_VERSION_NOTIFICATIONS_ENABLED: "false"
+      N8N_TEMPLATES_ENABLED: "false"
+      N8N_PERSONALIZATION_ENABLED: "false"
+      N8N_RESTRICT_FILE_ACCESS_TO: /data
+      N8N_BLOCK_FILE_ACCESS_TO_N8N_FILES: "true"
+      # n8n saves execution data by default, and that data contains the survey text (tool results,
+      # uploaded files). Keep none of it: nothing is written to the n8n database or disk.
+      EXECUTIONS_DATA_SAVE_ON_SUCCESS: none
+      EXECUTIONS_DATA_SAVE_ON_ERROR: none
+      EXECUTIONS_DATA_SAVE_ON_PROGRESS: "false"
+      EXECUTIONS_DATA_SAVE_MANUAL_EXECUTIONS: "false"
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: "1"
+      N8N_DEFAULT_BINARY_DATA_MODE: default      # uploaded files stay in memory, not in the n8n volume
+    volumes:
+      - n8n_home:/home/node/.n8n
+      - ./n8n/data:/data                 # drop spreadsheets in data/in, results appear in data/out
+      - ./n8n/workflows:/workflows:ro
+    restart: unless-stopped
+
+  ollama:
+    profiles: [ollama]
+    image: ollama/ollama:latest
+    volumes:
+      - ollama:/root/.ollama
+    # Not published: n8n reaches it at http://ollama:11434. Pull a tool-capable model with:
+    #   docker compose exec ollama ollama pull llama3.1
+
+volumes:
+  n8n_home:
+  ollama:
