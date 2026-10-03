@@ -4,7 +4,12 @@ import argparse
 import pandas as pd
 import logging
 import sys
+import os
 import string
+
+import numpy as np
+
+import llm
 
 def setup_logging():
     """Set up logging configuration."""
@@ -21,6 +26,21 @@ def parse_arguments(argv=None):
                         help='1-based row holding column headers (default 1, 0 = no header row)')
     parser.add_argument('--clusters', type=int, default=5, help='Number of groups (default 5)')
     parser.add_argument('--output', default='summary_output.csv', help='Output CSV (default summary_output.csv)')
+    parser.add_argument('--llm', default='auto',
+                        help='Labeling model provider: auto (default; first local server found), none, '
+                             + ', '.join(llm.PRESETS) + '. Local servers keep data on this machine.')
+    parser.add_argument('--model', help='Model name for the provider (local servers default to what is loaded)')
+    parser.add_argument('--base-url', help='Override the provider URL (needed for openai-compatible)')
+    parser.add_argument('--api-key-env', help='Environment variable holding the API key (default per provider)')
+    parser.add_argument('--allow-remote', action='store_true',
+                        help='Permit sending sampled cluster text to a remote provider. Off by default.')
+    parser.add_argument('--offline', action='store_true',
+                        help='Air-gapped mode: never touch the network except a local LLM server; '
+                             'the embedding model must already be on disk')
+    parser.add_argument('--embedding-model', default='all-MiniLM-L6-v2',
+                        help='Sentence-transformers model name or local directory (default all-MiniLM-L6-v2)')
+    parser.add_argument('--sample-size', type=int, default=8,
+                        help='Responses per cluster shown to the LLM (default 8)')
     return parser.parse_args(argv)
 
 def list_sheets(filename, requested=None):
@@ -164,10 +184,10 @@ def load_data(filename, sheet_name, selection_type, selection_value, header_row=
         logging.error(f"Error loading data: {e}")
         sys.exit(1)
 
-def compute_embeddings(data):
+def compute_embeddings(data, model_name='all-MiniLM-L6-v2'):
     try:
         from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer('all-MiniLM-L6-v2')
+        model = SentenceTransformer(model_name)
         embeddings = model.encode(data, show_progress_bar=True)
         return embeddings
     except Exception as e:
@@ -187,10 +207,10 @@ def cluster_embeddings(embeddings, n_clusters):
         logging.error(f"Error clustering embeddings: {e}")
         sys.exit(1)
 
-def extract_keyphrases(data, clusters):
+def extract_keyphrases(data, clusters, model_name='all-MiniLM-L6-v2'):
     try:
         from keybert import KeyBERT
-        kw_model = KeyBERT()
+        kw_model = KeyBERT(model=model_name)
         cluster_keyphrases = {}
 
         for cluster_id in set(clusters):
@@ -204,57 +224,81 @@ def extract_keyphrases(data, clusters):
         logging.error(f"Error extracting keyphrases: {e}")
         return {}
 
-def generate_actionable_summary(cluster_texts):
+def representative_indices(embeddings, clusters, cluster_id, n):
+    """Indices of the n responses closest to the cluster centroid (the most typical ones)."""
+    idx = np.where(np.asarray(clusters) == cluster_id)[0]
+    vecs = np.asarray(embeddings)[idx]
+    dist = np.linalg.norm(vecs - vecs.mean(axis=0), axis=1)
+    return [int(idx[i]) for i in np.argsort(dist)[:n]]
+
+def csv_safe(value):
+    """Neutralize spreadsheet formula injection: cells starting with = + - @ are executed by Excel."""
+    text = str(value)
+    return "'" + text if text[:1] in ('=', '+', '-', '@', '\t', '\r') else text
+
+def build_report(data, clusters, keyphrases, embeddings, config=None, sample_size=8):
+    """One row per cluster. With a provider config, rows also get an LLM label/summary/action."""
+    rows = []
+    for cluster_id in sorted(set(clusters)):
+        members = [i for i in range(len(data)) if clusters[i] == cluster_id]
+        reps = representative_indices(embeddings, clusters, cluster_id, sample_size)
+        phrases = keyphrases.get(cluster_id, [])
+        label = {'label': '', 'summary': '', 'action': ''}
+        if config is not None:
+            try:
+                label = llm.label_cluster(config, [data[i] for i in reps], phrases) or label
+            except llm.LLMError as e:
+                logging.warning(f"Cluster {cluster_id}: labeling failed ({e}); keeping keyphrases only.")
+        rows.append({
+            'Cluster': cluster_id,
+            'Size': len(members),
+            'Label': label['label'],
+            'Summary': label['summary'],
+            'Suggested Action': label['action'],
+            'Keyphrases': ', '.join(phrases),
+            'Representative Responses': ' | '.join(data[i] for i in reps[:3]),
+            'Responses': ', '.join(str(i + 1) for i in members),
+        })
+    return rows
+
+def save_results_to_csv(rows, output_filename='summary_output.csv'):
     try:
-        from transformers import pipeline
-        summarizer = pipeline('summarization', model='facebook/bart-large-cnn')
-        actionable_summaries = []
-
-        for response in cluster_texts:
-            input_length = len(response.split())
-            if input_length < 15:
-                actionable_summaries.append(response)
-                continue
-
-            dynamic_max_length = max(10, input_length - 5)
-            dynamic_min_length = max(5, input_length - 10)
-            summary = summarizer(response, max_length=dynamic_max_length, min_length=dynamic_min_length, do_sample=False)[0]['summary_text']
-            actionable_summaries.append(summary)
-
-        return list(set(actionable_summaries))
-    except Exception as e:
-        logging.error(f"Error generating actionable summaries: {e}")
-        return ["Error generating summary"]
-
-def save_results_to_csv(data, clusters, keyphrases, output_filename='summary_output.csv'):
-    try:
-        cluster_mapping = {}
-        for idx, cluster_id in enumerate(clusters):
-            if cluster_id not in cluster_mapping:
-                cluster_mapping[cluster_id] = []
-            cluster_mapping[cluster_id].append(data[idx])
-
-        summary_mapping = []
-        for cluster_id, responses in cluster_mapping.items():
-            summaries = generate_actionable_summary(responses)
-            keyphrase_summary = ', '.join(keyphrases.get(cluster_id, []))
-            summary_mapping.append({
-                'Cluster': cluster_id,
-                'Keyphrases': keyphrase_summary,
-                'Actionable Summary': "; ".join(summaries),
-                'Responses': ", ".join([str(i + 1) for i in range(len(data)) if clusters[i] == cluster_id])
-            })
-
-        df = pd.DataFrame(summary_mapping)
+        df = pd.DataFrame(rows)
+        for col in df.select_dtypes(include='object').columns:
+            df[col] = df[col].map(csv_safe)
         df.to_csv(output_filename, index=False)
         logging.info(f"Results saved to {output_filename}")
     except Exception as e:
         logging.error(f"Error saving results to CSV: {e}")
         sys.exit(1)
 
+def choose_provider(args):
+    """Resolve the labeling provider and enforce the local-first policy. Returns a config or None."""
+    if args.llm == 'none':
+        return None
+    try:
+        config = llm.resolve_config(args.llm, args.model, args.base_url, args.api_key_env)
+        if config is None:
+            logging.warning("No local LLM server found (tried ollama, llamacpp, lmstudio). "
+                            "Continuing with keyphrases only; start one or pass --llm.")
+            return None
+        llm.check_policy(config, args.allow_remote, args.offline)
+    except llm.LLMError as e:
+        logging.error(e)
+        sys.exit(2)
+    where = "local (data stays on this machine)" if config.is_local else f"REMOTE ({config.host})"
+    logging.info(f"Labeling with {config.preset.name} / {config.model}: {where}")
+    if not config.is_local:
+        logging.warning(f"Up to {args.sample_size} responses per cluster will be sent to {config.host}.")
+    return config
+
 def main():
     setup_logging()
     args = parse_arguments()
+    if args.offline:
+        os.environ['HF_HUB_OFFLINE'] = '1'
+        os.environ['TRANSFORMERS_OFFLINE'] = '1'
+    config = choose_provider(args)
 
     sheet_name = list_sheets(args.filename, args.sheet)
     df = pd.read_excel(args.filename, sheet_name=sheet_name, header=None)
@@ -262,16 +306,17 @@ def main():
     data = load_data(args.filename, sheet_name, selection_type, selection_value, args.header_row)
 
     logging.info("Computing embeddings...")
-    embeddings = compute_embeddings(data)
+    embeddings = compute_embeddings(data, args.embedding_model)
 
     n_clusters = max(1, min(len(data), args.clusters))
     logging.info("Clustering embeddings...")
     clusters = cluster_embeddings(embeddings, n_clusters)
 
     logging.info("Extracting keyphrases for each cluster...")
-    keyphrases = extract_keyphrases(data, clusters)
+    keyphrases = extract_keyphrases(data, clusters, args.embedding_model)
 
-    save_results_to_csv(data, clusters, keyphrases, args.output)
+    rows = build_report(data, clusters, keyphrases, embeddings, config, args.sample_size)
+    save_results_to_csv(rows, args.output)
 
 if __name__ == '__main__':
     main()

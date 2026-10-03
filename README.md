@@ -3,14 +3,23 @@
 Summarize and group free-form answers within spreadsheets.
 
 texturr reads one column (or row) of free-text answers from an Excel file,
-groups similar answers together with sentence embeddings, and writes a CSV
-with each group's keyphrases, a summary, and the response numbers it contains.
+groups similar answers together with sentence embeddings, has an LLM name and
+summarize each group, and writes a CSV.
+
+**Built for sensitive data: local-first.** By default everything runs on your
+machine: embeddings use a local model and labeling uses a local LLM server
+(Ollama, llama.cpp, LM Studio). Sending text to a hosted provider is possible but
+off unless you pass `--allow-remote`, and `--offline` forbids it outright.
 
 ## Install
 
 ```bash
-pip install pandas openpyxl tqdm scikit-learn sentence-transformers transformers keybert
+pip install -r requirements.txt
 ```
+
+For LLM labels, run any local server, for example `ollama serve` with a model
+pulled (`ollama pull llama3.1`). With no server found, texturr still works and
+fills in keyphrases only. No provider SDKs are needed.
 
 ## Usage
 
@@ -30,15 +39,75 @@ python3 texturr.py survey.xlsx --sheet "Q3 Results" --column Comments --clusters
 | `--header-row N` | Row holding column headers (default `1`; `0` means no header row). Header text is used for naming columns and is excluded from the answers. |
 | `--clusters K` | Number of groups (default `5`). |
 | `--output` | Output CSV path (default `summary_output.csv`). |
+| `--llm` | Labeling provider: `auto` (default, first local server found), `none`, or one of `ollama`, `llamacpp`, `lmstudio`, `anthropic`, `openai`, `gemini`, `mistral`, `groq`, `openrouter`, `openai-compatible`. |
+| `--model` | Model name. Local servers default to the model they have loaded; hosted providers have a default you can override. |
+| `--base-url` | Override the provider URL (required for `openai-compatible`, e.g. vLLM). |
+| `--api-key-env` | Name of the environment variable holding the key (default per provider). |
+| `--allow-remote` | Permit sending sampled cluster text to a remote provider. |
+| `--offline` | Air-gapped mode: no network except a loopback LLM server; remote providers are refused. |
+| `--embedding-model` | Sentence-transformers model name or local directory (default `all-MiniLM-L6-v2`). |
+| `--sample-size` | Responses per cluster shown to the LLM (default 8). |
+
+## Privacy model
+
+- **Local by default.** Providers on `localhost` are local; everything else is
+  treated as remote, including LAN addresses.
+- **Remote is opt-in.** A remote provider fails with an explanation unless
+  `--allow-remote` is passed, and texturr logs the host and how many responses
+  per cluster will be sent. Only a sample of each cluster goes out
+  (`--sample-size`, each response truncated to 400 characters), never the whole sheet.
+- **API keys come from environment variables only**, never the command line, so
+  they stay out of shell history and process listings. They are never logged.
+- **Air-gapped use:** pre-download the embedding model, point `--embedding-model`
+  at its directory, and pass `--offline`. That blocks Hugging Face downloads and
+  refuses remote providers.
+- **Responses are treated as untrusted.** They are fenced in the prompt with an
+  instruction not to follow anything inside them, and model replies are parsed
+  strictly.
+- **The output CSV contains verbatim responses.** Handle it at the same
+  classification as the input. Cells starting with `=`, `+`, `-`, `@` are
+  prefixed with `'` so opening the CSV in Excel cannot run formulas.
+
+```bash
+# Local only (default behavior)
+python3 texturr.py survey.xlsx --column Comments --llm ollama --model llama3.1
+
+# Air-gapped
+python3 texturr.py survey.xlsx --column Comments --offline --embedding-model ./models/all-MiniLM-L6-v2
+
+# Hosted, deliberately
+export ANTHROPIC_API_KEY=...
+python3 texturr.py survey.xlsx --column Comments --llm anthropic --allow-remote
+```
 
 In the interactive prompt, type a column letter, a header name, or `row N`.
 
 ## Output
 
-One row per group: `Cluster`, `Keyphrases`, `Actionable Summary`, `Responses`
-(1-based positions of the answers in that group).
+One row per group: `Cluster`, `Size`, `Label` (LLM theme name), `Summary`,
+`Suggested Action`, `Keyphrases`, `Representative Responses` (the three closest to
+the group's center), and `Responses` (1-based positions of the answers in the group).
+`Label`, `Summary` and `Suggested Action` are empty when no LLM is used.
+
+## Tests
+
+```bash
+python3 -m pytest
+```
+
+The tests use a stub local HTTP server, so they need no model or network.
 
 ## Changelog
+
+- **Local-first LLM labeling**: new `llm.py` supports local servers (Ollama,
+  llama.cpp, LM Studio, any OpenAI-compatible endpoint) and hosted providers
+  (Anthropic, OpenAI, Gemini, Mistral, Groq, OpenRouter) with keys read from the
+  environment. Remote use requires `--allow-remote`; `--offline` forbids it.
+  Replaced the per-response BART summarizer (which barely shortened one-line
+  answers) with one LLM label, summary and suggested action per cluster, plus
+  representative responses. Output columns changed (`Actionable Summary` is
+  gone). KeyBERT now uses `--embedding-model` instead of a second hidden download.
+  Output cells are neutralized against spreadsheet formula injection. Added tests.
 
 - **Column picker**: the grouping column is now chosen by letter or header name,
   via `--column` or an interactive list that shows headers and sample answers.
@@ -48,7 +117,7 @@ One row per group: `Cluster`, `Keyphrases`, `Actionable Summary`, `Responses`
 
 ## Status and plans
 
-This is an early prototype. Planned: LLM-written theme labels with representative
-quotes, automatic choice of cluster count, an evaluation on a public labeled
-dataset, tests and CI, and a shareable HTML report. This README is updated with
-every change.
+This is an early prototype. Planned: automatic choice of cluster count, an
+evaluation on a public labeled dataset, CI, and a shareable HTML report. The
+LLM path has been tested against a stub server but not yet against a real model.
+This README is updated with every change.
