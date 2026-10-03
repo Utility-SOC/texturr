@@ -1,32 +1,45 @@
 #!/usr/bin/env python3
+"""texturr: group and summarize free-form answers in a spreadsheet, local-first."""
 
 import argparse
-import pandas as pd
 import logging
-import sys
 import os
 import string
+import sys
 
 import numpy as np
+import pandas as pd
 
+import clustering
 import llm
 import models
+import report
+
+CSV_SUFFIXES = ('.csv', '.tsv', '.tab')
+
 
 def setup_logging():
     """Set up logging configuration."""
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
+
 def parse_arguments(argv=None):
     """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(description='Group and summarize free-form answers in an Excel spreadsheet.')
-    parser.add_argument('filename', type=str, help='Excel file name (xlsx format)')
+    parser = argparse.ArgumentParser(description='Group and summarize free-form answers in a spreadsheet.')
+    parser.add_argument('filename', type=str, help='Excel (.xlsx) or CSV/TSV file')
     parser.add_argument('--sheet', help='Sheet name or 1-based number (prompts if omitted and there are several)')
-    parser.add_argument('--column', help='Column to group: a letter (C) or a header name ("Comments"). Prompts if omitted.')
+    parser.add_argument('--column', nargs='+',
+                        help='Column(s) to group: letters (C) or header names ("Comments"). Several are analyzed '
+                             'separately. Prompts if omitted.')
     parser.add_argument('--row', type=int, help='Group the answers in this 1-based row instead of a column')
     parser.add_argument('--header-row', type=int, default=1,
                         help='1-based row holding column headers (default 1, 0 = no header row)')
-    parser.add_argument('--clusters', type=int, default=5, help='Number of groups (default 5)')
-    parser.add_argument('--output', default='summary_output.csv', help='Output CSV (default summary_output.csv)')
+    parser.add_argument('--clusters', default='auto',
+                        help="Number of groups: 'auto' (default; best silhouette score from 2 to 12) or a number")
+    parser.add_argument('--output', default='summary_output.csv', help='Summary CSV (default summary_output.csv)')
+    parser.add_argument('--html', metavar='PATH', help='Also write a self-contained HTML report')
+    parser.add_argument('--annotated', metavar='PATH',
+                        help='Also write a copy of the input with cluster and theme columns added beside the data')
     parser.add_argument('--llm', default='auto',
                         help='Labeling model provider: auto (default; first local server found), none, '
                              + ', '.join(llm.PRESETS) + '. Local servers keep data on this machine.')
@@ -42,10 +55,30 @@ def parse_arguments(argv=None):
                         help='Sentence-transformers model name or local directory (default all-MiniLM-L6-v2)')
     parser.add_argument('--sample-size', type=int, default=8,
                         help='Responses per cluster shown to the LLM (default 8)')
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    try:
+        args.clusters = clustering.parse_clusters(args.clusters)
+    except ValueError as e:
+        parser.error(str(e))
+    return args
+
+
+def is_table_file(filename):
+    return filename.lower().endswith(CSV_SUFFIXES)
+
+
+def read_frame(filename, sheet_name=None):
+    """Read a sheet (or a CSV/TSV file) as raw cells, with no header interpretation."""
+    if is_table_file(filename):
+        sep = '\t' if filename.lower().endswith(('.tsv', '.tab')) else ','
+        return pd.read_csv(filename, header=None, sep=sep, dtype=str, skip_blank_lines=False)
+    return pd.read_excel(filename, sheet_name=sheet_name if sheet_name is not None else 0, header=None)
+
 
 def list_sheets(filename, requested=None):
-    """List all sheets in the Excel workbook and allow user to select one."""
+    """List all sheets in the Excel workbook and allow user to select one. CSV/TSV files have none."""
+    if is_table_file(filename):
+        return None
     try:
         xl = pd.ExcelFile(filename)
         sheet_names = xl.sheet_names
@@ -81,6 +114,7 @@ def list_sheets(filename, requested=None):
         logging.error(f"Error reading Excel file: {e}")
         sys.exit(1)
 
+
 def column_labels(df, header_row):
     """Map column letter -> header text (or the letter itself when there is no header)."""
     labels = {}
@@ -92,12 +126,14 @@ def column_labels(df, header_row):
         labels[letter] = text or letter
     return labels
 
+
 def resolve_column(value, labels):
     """Resolve a letter or header name to a column letter, or None if no match."""
     if value.upper() in labels and value.isalpha():
         return value.upper()
     matches = [k for k, v in labels.items() if v.lower() == value.lower()]
     return matches[0] if len(matches) == 1 else None
+
 
 def show_columns(df, labels, header_row):
     print("Columns:")
@@ -106,25 +142,30 @@ def show_columns(df, labels, header_row):
         sample = str(col.iloc[0])[:40] if len(col) else ''
         print(f"  {letter:>3}  {label[:30]:<30}  {len(col):>5} answers  e.g. {sample!r}")
 
+
 def get_row_or_column(df, header_row=1, column=None, row=None):
-    """Return ('column', letter) or ('row', number), from flags or an interactive prompt."""
+    """Return ('column', [letters]) or ('row', number), from flags or an interactive prompt."""
     labels = column_labels(df, header_row)
     if row is not None:
         if not 1 <= row <= len(df):
             logging.error(f"Row {row} is out of range (1-{len(df)}).")
             sys.exit(1)
         return 'row', row
-    if column is not None:
-        letter = resolve_column(column, labels)
-        if letter is None:
-            logging.error(f"Column '{column}' not found. Available: {get_available_columns(df, labels)}")
-            sys.exit(1)
-        logging.info(f"Selected column {letter} ('{labels[letter]}')")
-        return 'column', letter
+    if column:
+        letters = []
+        for value in column:
+            letter = resolve_column(value, labels)
+            if letter is None:
+                logging.error(f"Column '{value}' not found. Available: {get_available_columns(df, labels)}")
+                sys.exit(1)
+            if letter not in letters:
+                letters.append(letter)
+        logging.info("Selected column(s): " + ', '.join(f"{c} ('{labels[c]}')" for c in letters))
+        return 'column', letters
     show_columns(df, labels, header_row)
     while True:
         try:
-            selection = input("Column to group (letter or header name), or 'row N': ").strip()
+            selection = input("Column(s) to group (letters or header names, comma-separated), or 'row N': ").strip()
         except EOFError:
             print("\nNo input detected. Exiting the program.")
             sys.exit(1)
@@ -134,16 +175,18 @@ def get_row_or_column(df, header_row=1, column=None, row=None):
                 return 'row', int(num)
             print(f"Please enter a row number between 1 and {len(df)}.")
             continue
-        letter = resolve_column(selection, labels)
-        if letter:
-            logging.info(f"Selected column {letter} ('{labels[letter]}')")
-            return 'column', letter
-        print("No such column. Try a letter, a header name, or 'row N'.")
+        parts = [p.strip() for p in selection.split(',') if p.strip()]
+        letters = [resolve_column(p, labels) for p in parts]
+        if parts and all(letters):
+            return 'column', list(dict.fromkeys(letters))
+        print("No such column. Try letters, header names, or 'row N'.")
+
 
 def get_available_columns(df, labels=None):
     if labels:
         return ', '.join(f"{k} ({v})" if v != k else k for k, v in labels.items())
     return ', '.join(index_to_column_letter(i) for i in range(df.shape[1]))
+
 
 def column_letter_to_index(letter):
     letter = letter.upper()
@@ -156,6 +199,7 @@ def column_letter_to_index(letter):
             raise ValueError(f"Invalid column letter: {letter}")
     return result - 1
 
+
 def index_to_column_letter(index):
     index += 1
     result = ''
@@ -164,66 +208,60 @@ def index_to_column_letter(index):
         result = chr(65 + remainder) + result
     return result
 
-def load_data(filename, sheet_name, selection_type, selection_value, header_row=1):
-    try:
-        df = pd.read_excel(filename, sheet_name=sheet_name, header=None)
-        if selection_type == 'column':
-            col_index = column_letter_to_index(selection_value)
-            if col_index >= df.shape[1]:
-                raise ValueError(f"Column '{selection_value}' does not exist in the spreadsheet.")
-            data_series = df.iloc[header_row:, col_index].dropna().astype(str)
-        elif selection_type == 'row':
-            row_index = selection_value - 1
-            if not 0 <= row_index < len(df):
-                raise ValueError(f"Row '{selection_value}' does not exist in the spreadsheet.")
-            data_series = df.iloc[row_index, :].dropna().astype(str)
-        else:
-            raise ValueError('Selection type must be either "row" or "column".')
-        logging.info(f"Loaded {len(data_series)} items from the spreadsheet.")
-        return data_series.tolist()
-    except Exception as e:
-        logging.error(f"Error loading data: {e}")
-        sys.exit(1)
+
+def extract_answers(df, selection_type, selection_value, header_row=1):
+    """Return (texts, positions): the non-empty answers and their 0-based row (column mode) or column index."""
+    if selection_type == 'column':
+        col_index = column_letter_to_index(selection_value)
+        if col_index >= df.shape[1]:
+            raise ValueError(f"Column '{selection_value}' does not exist in the spreadsheet.")
+        series = df.iloc[header_row:, col_index].dropna().astype(str)
+        series = series[series.str.strip() != '']
+    elif selection_type == 'row':
+        row_index = selection_value - 1
+        if not 0 <= row_index < len(df):
+            raise ValueError(f"Row '{selection_value}' does not exist in the spreadsheet.")
+        series = df.iloc[row_index, :].dropna().astype(str)
+        series = series[series.str.strip() != '']
+    else:
+        raise ValueError('Selection type must be either "row" or "column".')
+    return series.tolist(), [int(i) for i in series.index]
+
+
+_models = {}
+
+
+def _sentence_model(model_name):
+    """Load the sentence-transformers model once and share it with KeyBERT."""
+    if model_name not in _models:
+        from sentence_transformers import SentenceTransformer
+        _models[model_name] = SentenceTransformer(model_name)
+    return _models[model_name]
+
 
 def compute_embeddings(data, model_name='all-MiniLM-L6-v2'):
     try:
-        from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer(model_name)
-        embeddings = model.encode(data, show_progress_bar=True)
-        return embeddings
+        return _sentence_model(model_name).encode(data, show_progress_bar=len(data) > 200)
     except Exception as e:
         logging.error(f"Error computing embeddings: {e}")
         sys.exit(1)
 
-def cluster_embeddings(embeddings, n_clusters):
-    try:
-        from tqdm import tqdm
-        from sklearn.cluster import KMeans
-        clustering_model = KMeans(n_clusters=n_clusters, random_state=42)
-        with tqdm(total=1, desc="Clustering embeddings") as pbar:
-            cluster_assignment = clustering_model.fit_predict(embeddings)
-            pbar.update(1)
-        return cluster_assignment
-    except Exception as e:
-        logging.error(f"Error clustering embeddings: {e}")
-        sys.exit(1)
 
 def extract_keyphrases(data, clusters, model_name='all-MiniLM-L6-v2'):
     try:
         from keybert import KeyBERT
-        kw_model = KeyBERT(model=model_name)
+        kw_model = KeyBERT(model=_sentence_model(model_name))
         cluster_keyphrases = {}
-
         for cluster_id in set(clusters):
             cluster_texts = [data[i] for i in range(len(data)) if clusters[i] == cluster_id]
-            combined_text = ' '.join(cluster_texts)
-            keyphrases = kw_model.extract_keywords(combined_text, keyphrase_ngram_range=(1, 2), stop_words='english', top_n=5)
+            keyphrases = kw_model.extract_keywords(' '.join(cluster_texts), keyphrase_ngram_range=(1, 2),
+                                                   stop_words='english', top_n=5)
             cluster_keyphrases[cluster_id] = [kw for kw, _ in keyphrases]
-
         return cluster_keyphrases
     except Exception as e:
         logging.error(f"Error extracting keyphrases: {e}")
         return {}
+
 
 def representative_indices(embeddings, clusters, cluster_id, n):
     """Indices of the n responses closest to the cluster centroid (the most typical ones)."""
@@ -232,15 +270,17 @@ def representative_indices(embeddings, clusters, cluster_id, n):
     dist = np.linalg.norm(vecs - vecs.mean(axis=0), axis=1)
     return [int(idx[i]) for i in np.argsort(dist)[:n]]
 
+
 def csv_safe(value):
     """Neutralize spreadsheet formula injection: cells starting with = + - @ are executed by Excel."""
     text = str(value)
     return "'" + text if text[:1] in ('=', '+', '-', '@', '\t', '\r') else text
 
+
 def build_report(data, clusters, keyphrases, embeddings, config=None, sample_size=8):
     """One row per cluster. With a provider config, rows also get an LLM label/summary/action."""
     rows = []
-    for cluster_id in sorted(set(clusters)):
+    for cluster_id in sorted(set(int(c) for c in clusters)):
         members = [i for i in range(len(data)) if clusters[i] == cluster_id]
         reps = representative_indices(embeddings, clusters, cluster_id, sample_size)
         phrases = keyphrases.get(cluster_id, [])
@@ -262,6 +302,7 @@ def build_report(data, clusters, keyphrases, embeddings, config=None, sample_siz
         })
     return rows
 
+
 def save_results_to_csv(rows, output_filename='summary_output.csv'):
     try:
         df = pd.DataFrame(rows)
@@ -272,6 +313,7 @@ def save_results_to_csv(rows, output_filename='summary_output.csv'):
     except Exception as e:
         logging.error(f"Error saving results to CSV: {e}")
         sys.exit(1)
+
 
 def choose_provider(args):
     """Resolve the labeling provider and enforce the local-first policy. Returns a config or None."""
@@ -297,6 +339,18 @@ def choose_provider(args):
         logging.warning(f"Up to {args.sample_size} responses per cluster will be sent to {config.host}.")
     return config
 
+
+def analyze(data, args, config):
+    """Embed, cluster and describe one list of answers. Returns (rows, clusters)."""
+    logging.info("Computing embeddings...")
+    embeddings = compute_embeddings(data, args.embedding_model)
+    clusters, k, scores = clustering.cluster(embeddings, args.clusters)
+    if args.clusters == 'auto':
+        logging.info(f"Chose {k} groups automatically" + (f" (silhouette {scores[k]:.2f})" if scores else ""))
+    keyphrases = extract_keyphrases(data, clusters, args.embedding_model)
+    return build_report(data, clusters, keyphrases, embeddings, config, args.sample_size), clusters
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == 'models':
         sys.exit(models.cli(sys.argv[2:]))
@@ -308,22 +362,47 @@ def main():
     config = choose_provider(args)
 
     sheet_name = list_sheets(args.filename, args.sheet)
-    df = pd.read_excel(args.filename, sheet_name=sheet_name, header=None)
+    df = read_frame(args.filename, sheet_name)
     selection_type, selection_value = get_row_or_column(df, args.header_row, args.column, args.row)
-    data = load_data(args.filename, sheet_name, selection_type, selection_value, args.header_row)
+    targets = selection_value if selection_type == 'column' else [None]
+    labels = column_labels(df, args.header_row)
 
-    logging.info("Computing embeddings...")
-    embeddings = compute_embeddings(data, args.embedding_model)
+    all_rows, results, annotations = [], [], []
+    for target in targets:
+        try:
+            data, positions = extract_answers(df, selection_type, target if target else selection_value, args.header_row)
+        except ValueError as e:
+            logging.error(f"Error loading data: {e}")
+            sys.exit(1)
+        name = labels[target] if target else f"Row {selection_value}"
+        logging.info(f"{name}: {len(data)} answers")
+        if not data:
+            logging.warning(f"{name}: no answers found; skipping.")
+            continue
+        rows, clusters = analyze(data, args, config)
+        rows = [{'Column': name, **r} for r in rows]
+        all_rows += rows
+        results.append((name, rows, len(data)))
+        annotations.append({'header': name, 'positions': positions, 'clusters': clusters,
+                            'labels': {r['Cluster']: r['Label'] or ', '.join(r['Keyphrases'].split(', ')[:3]) for r in rows}})
 
-    n_clusters = max(1, min(len(data), args.clusters))
-    logging.info("Clustering embeddings...")
-    clusters = cluster_embeddings(embeddings, n_clusters)
+    if not all_rows:
+        logging.error("Nothing to analyze.")
+        sys.exit(1)
+    save_results_to_csv(all_rows, args.output)
+    if args.html:
+        report.write_html(args.html, args.filename, results, 'labeled by ' + config.model if config else 'keyphrases only')
+        logging.info(f"HTML report saved to {args.html}")
+    if args.annotated:
+        if selection_type != 'column':
+            logging.warning("--annotated applies to column analysis only; skipped.")
+        elif is_table_file(args.filename):
+            report.annotate_csv(args.filename, annotations, args.annotated, csv_safe, args.header_row)
+            logging.info(f"Annotated copy saved to {args.annotated}")
+        else:
+            report.annotate_workbook(args.filename, sheet_name, annotations, args.annotated, args.header_row)
+            logging.info(f"Annotated copy saved to {args.annotated}")
 
-    logging.info("Extracting keyphrases for each cluster...")
-    keyphrases = extract_keyphrases(data, clusters, args.embedding_model)
-
-    rows = build_report(data, clusters, keyphrases, embeddings, config, args.sample_size)
-    save_results_to_csv(rows, args.output)
 
 if __name__ == '__main__':
     main()

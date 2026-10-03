@@ -58,14 +58,26 @@ def test_all_orgs_failing_raises():
         models.recommend(('a', 'b'), get=get, now=NOW)
 
 
-def test_pick_file_refuses_shards_and_unverifiable():
-    tree = [{'path': 'm-Q4_K_M-00001-of-00002.gguf', 'lfs': {'oid': 'x', 'size': 1}},
-            {'path': 'm-Q8_0.gguf', 'lfs': {'oid': 'y', 'size': 2}}]
-    with pytest.raises(models.ModelsError, match='Available'):
-        models.pick_file('o/r', 's', 'Q4_K_M', get=lambda u: tree)
-    assert models.pick_file('o/r', 's', 'Q8_0', get=lambda u: tree)['sha256'] == 'y'
+def test_pick_files_single_sharded_and_unverifiable():
+    f = lambda p, oid='x', size=1: {'path': p, 'lfs': {'oid': oid, 'size': size}}
+    tree = [f('m-Q4_K_M-00002-of-00002.gguf', 'b'), f('m-Q4_K_M-00001-of-00002.gguf', 'a'), f('m-Q8_0.gguf', 'y')]
+    assert [x['sha256'] for x in models.pick_files('o/r', 's', 'Q4_K_M', get=lambda u: tree)] == ['a', 'b']   # shards in order
+    assert [x['sha256'] for x in models.pick_files('o/r', 's', 'Q8_0', get=lambda u: tree)] == ['y']
+    with pytest.raises(models.ModelsError, match='Available'):                    # incomplete shard set
+        models.pick_files('o/r', 's', 'Q4_K_M', get=lambda u: [f('m-Q4_K_M-00001-of-00002.gguf')])
     with pytest.raises(models.ModelsError, match='unverifiable'):
-        models.pick_file('o/r', 's', 'Q8_0', get=lambda u: [{'path': 'm-Q8_0.gguf'}])
+        models.pick_files('o/r', 's', 'Q8_0', get=lambda u: [{'path': 'm-Q8_0.gguf'}])
+
+
+def test_serve_command_binds_loopback_only(tmp_path):
+    model = tmp_path / 'm.gguf'
+    model.write_text('x')
+    cmd = models.serve_command(str(model), 9000, which=lambda n: '/usr/bin/llama-server')
+    assert cmd[cmd.index('--host') + 1] == '127.0.0.1' and cmd[cmd.index('--port') + 1] == '9000'
+    with pytest.raises(models.ModelsError, match='llama-server'):
+        models.serve_command(str(model), which=lambda n: None)
+    with pytest.raises(models.ModelsError, match='No such model'):
+        models.serve_command(str(tmp_path / 'nope.gguf'), which=lambda n: '/x')
 
 
 class Blob(BaseHTTPRequestHandler):
@@ -113,3 +125,14 @@ def test_pull_requires_consent_and_pins_revision(monkeypatch, tmp_path, blob_url
     path = models.pull(c, yes=True, get=lambda u: tree, fetch=fetch)
     assert 'f' * 40 in calls[0] and '/resolve/' in calls[0]   # pinned to the commit, not 'main'
     assert open(path + '.provenance.json').read().count(good) == 1
+
+
+def test_pull_downloads_every_shard_and_returns_first(monkeypatch, tmp_path, blob_url):
+    monkeypatch.setenv('TEXTURR_HOME', str(tmp_path))
+    good = hashlib.sha256(Blob.payload).hexdigest()
+    tree = [{'path': f'm-Q4_K_M-0000{i}-of-00002.gguf', 'lfs': {'oid': good, 'size': len(Blob.payload)}} for i in (1, 2)]
+    c = models.Candidate('o/r-GGUF', 'o', 'apache-2.0', 8.0, 1, 1, '2026-09-01', 'e' * 40)
+    fetch = lambda url, dest, sha, size: models.download_verified(blob_url, dest, sha, size, None)
+    path = models.pull(c, yes=True, get=lambda u: tree, fetch=fetch)
+    assert path.endswith('00001-of-00002.gguf')
+    assert (tmp_path / 'models' / 'o__r-GGUF' / ('e' * 40) / 'm-Q4_K_M-00002-of-00002.gguf').exists()

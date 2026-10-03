@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import urllib.request
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ HUB = 'https://huggingface.co'
 # government procurement policies restrict them; add them with --orgs if your policy allows.
 DEFAULT_ORGS = ('ibm-granite', 'microsoft', 'mistralai', 'allenai', 'HuggingFaceTB', 'openai', 'nvidia')
 DEFAULT_LICENSES = ('apache-2.0', 'mit')
+SHARD = re.compile(r'-(\d{5})-of-(\d{5})\.gguf$', re.I)
 
 
 class ModelsError(Exception):
@@ -127,19 +129,36 @@ def recommend(orgs=DEFAULT_ORGS, licenses=DEFAULT_LICENSES, max_params_b=14.0, m
     return out
 
 
-def pick_file(repo, sha, quant='Q4_K_M', get=_get_json):
-    """The single-file GGUF of the requested quantization at an exact commit."""
+def pick_files(repo, sha, quant='Q4_K_M', get=_get_json):
+    """GGUF file(s) of the requested quantization at an exact commit.
+
+    Returns a list of {'path','sha256','size'}: one entry normally, or every shard of a split
+    model in order (llama.cpp loads the whole set when given the first shard).
+    """
     tree = get(f"{HUB}/api/models/{repo}/tree/{sha}")
     ggufs = [f for f in tree if f.get('path', '').lower().endswith('.gguf')]
-    hits = [f for f in ggufs if quant.lower() in f['path'].lower() and '-of-' not in f['path']]
-    if not hits:
-        names = ', '.join(sorted(f['path'] for f in ggufs)) or 'none'
-        raise ModelsError(f"No single-file {quant} GGUF in {repo}@{sha[:8]}. Available: {names}")
-    f = min(hits, key=lambda f: len(f['path']))
-    lfs = f.get('lfs') or {}
-    if not lfs.get('oid'):
-        raise ModelsError(f"{f['path']} has no SHA-256 on the Hub; refusing to download an unverifiable file.")
-    return {'path': f['path'], 'sha256': lfs['oid'], 'size': lfs.get('size') or f.get('size', 0)}
+    hits = [f for f in ggufs if quant.lower() in f['path'].lower()]
+    single = [f for f in hits if not SHARD.search(f['path'])]
+    if single:
+        chosen = [min(single, key=lambda f: len(f['path']))]
+    else:
+        groups = {}
+        for f in hits:
+            m = SHARD.search(f['path'])
+            if m:
+                groups.setdefault((f['path'][:m.start()], int(m.group(2))), []).append((int(m.group(1)), f))
+        complete = [sorted(v) for (_, total), v in groups.items() if sorted(i for i, _ in v) == list(range(1, total + 1))]
+        if not complete:
+            names = ', '.join(sorted(f['path'] for f in ggufs)) or 'none'
+            raise ModelsError(f"No complete {quant} GGUF in {repo}@{sha[:8]}. Available: {names}")
+        chosen = [f for _, f in complete[0]]
+    out = []
+    for f in chosen:
+        lfs = f.get('lfs') or {}
+        if not lfs.get('oid'):
+            raise ModelsError(f"{f['path']} has no SHA-256 on the Hub; refusing to download an unverifiable file.")
+        out.append({'path': f['path'], 'sha256': lfs['oid'], 'size': lfs.get('size') or f.get('size', 0)})
+    return out
 
 
 def download_verified(url, dest, sha256, size=0, report=sys.stderr):
@@ -171,25 +190,32 @@ def cache_dir():
 
 
 def pull(c, quant='Q4_K_M', yes=False, ask=input, get=_get_json, fetch=download_verified):
-    """Consent, download at the pinned commit, verify, and record provenance. Returns the file path."""
-    info = pick_file(c.repo, c.sha, quant, get)
-    url = f"{HUB}/{c.repo}/resolve/{c.sha}/{info['path']}"
-    dest = os.path.join(cache_dir(), c.repo.replace('/', '__'), c.sha, os.path.basename(info['path']))
+    """Consent, download at the pinned commit, verify, and record provenance. Returns the path to load
+    (the first shard when the model is split)."""
+    files = pick_files(c.repo, c.sha, quant, get)
+    folder = os.path.join(cache_dir(), c.repo.replace('/', '__'), c.sha)
+    total = sum(f['size'] for f in files)
     print(f"\n  Model:     {c.repo}  ({c.params_b}B parameters, {quant})\n"
           f"  Publisher: {c.org}   License: {c.license}\n"
           f"  Revision:  {c.sha}  (pinned)\n"
-          f"  Source:    {url}\n"
-          f"  Size:      {info['size'] / 1e9:.1f} GB   Destination: {dest}\n"
-          f"  Integrity: SHA-256 {info['sha256']} will be verified")
-    if not yes and ask(f"Download {info['size'] / 1e9:.1f} GB from huggingface.co? [y/N] ").strip().lower() != 'y':
+          f"  Source:    {HUB}/{c.repo}/resolve/{c.sha}/\n"
+          f"  Files:     {', '.join(f['path'] for f in files)}\n"
+          f"  Size:      {total / 1e9:.1f} GB   Destination: {folder}\n"
+          f"  Integrity: SHA-256 of each file will be verified against the Hub's record")
+    if not yes and ask(f"Download {total / 1e9:.1f} GB from huggingface.co? [y/N] ").strip().lower() != 'y':
         raise ModelsError("Download cancelled.")
-    if not (os.path.exists(dest) and _sha256_file(dest) == info['sha256']):
-        fetch(url, dest, info['sha256'], info['size'])
-    with open(dest + '.provenance.json', 'w') as f:
-        json.dump({'repo': c.repo, 'revision': c.sha, 'file': info['path'], 'sha256': info['sha256'],
-                   'license': c.license, 'source': url, 'downloaded_at': datetime.now(timezone.utc).isoformat()},
-                  f, indent=2)
-    return dest
+    record = []
+    for f in files:
+        url = f"{HUB}/{c.repo}/resolve/{c.sha}/{f['path']}"
+        dest = os.path.join(folder, os.path.basename(f['path']))
+        if not (os.path.exists(dest) and _sha256_file(dest) == f['sha256']):
+            fetch(url, dest, f['sha256'], f['size'])
+        record.append({'file': f['path'], 'sha256': f['sha256'], 'source': url})
+    first = os.path.join(folder, os.path.basename(files[0]['path']))
+    with open(first + '.provenance.json', 'w') as out:
+        json.dump({'repo': c.repo, 'revision': c.sha, 'license': c.license, 'files': record,
+                   'downloaded_at': datetime.now(timezone.utc).isoformat()}, out, indent=2)
+    return first
 
 
 def _sha256_file(path):
@@ -202,8 +228,19 @@ def _sha256_file(path):
 
 def serve_hint(path):
     return (f"Start a local server (data stays on this machine), then re-run texturr:\n"
-            f"  llama-server -m '{path}' --jinja --port 8080\n"
+            f"  llama-server -m '{path}' --jinja --host 127.0.0.1 --port 8080\n"
             f"texturr finds it automatically with --llm auto (or --llm llamacpp).")
+
+
+def serve_command(path, port=8080, which=shutil.which):
+    """argv for a loopback-only llama.cpp server. Raises if llama-server is not installed."""
+    exe = which('llama-server')
+    if not exe:
+        raise ModelsError("llama-server was not found on PATH. Install llama.cpp (https://github.com/ggml-org/llama.cpp), "
+                          "or use Ollama/LM Studio with the downloaded file.")
+    if not os.path.isfile(path):
+        raise ModelsError(f"No such model file: {path}")
+    return [exe, '-m', path, '--jinja', '--host', '127.0.0.1', '--port', str(port)]
 
 
 def format_table(cands):
@@ -224,6 +261,9 @@ def build_parser():
     p.add_argument('--pull', type=int, metavar='N', help='Download item N from the list')
     p.add_argument('--quant', default='Q4_K_M', help='GGUF quantization to download (default Q4_K_M)')
     p.add_argument('--yes', action='store_true', help='Skip the download confirmation')
+    p.add_argument('--serve', nargs='?', const='', metavar='FILE',
+                   help='Start a loopback-only llama-server for FILE, or for the model just pulled with --pull')
+    p.add_argument('--port', type=int, default=8080, help='Port for --serve (default 8080)')
     return p
 
 
@@ -233,6 +273,11 @@ def cli(argv, get=_get_json):
         print("Offline mode is set; the live model list needs the network.", file=sys.stderr)
         return 2
     try:
+        if args.serve is not None and not args.pull:
+            if not args.serve:
+                raise ModelsError("--serve needs a model file, or use it with --pull N.")
+            cmd = serve_command(args.serve, args.port)
+            os.execv(cmd[0], cmd)
         cands = recommend(args.orgs, args.licenses, args.max_params_b, args.max_age_days, args.top, get=get)
         if not cands:
             print("No models passed the vetting rules; loosen --licenses, --orgs or --max-params-b.", file=sys.stderr)
@@ -243,7 +288,12 @@ def cli(argv, get=_get_json):
             if not 1 <= args.pull <= len(cands):
                 print(f"--pull must be between 1 and {len(cands)}.", file=sys.stderr)
                 return 2
-            print(serve_hint(pull(cands[args.pull - 1], args.quant, args.yes, get=get)))
+            path = pull(cands[args.pull - 1], args.quant, args.yes, get=get)
+            if args.serve is not None:
+                cmd = serve_command(path, args.port)
+                print("Starting:", ' '.join(cmd), "\n(Ctrl+C to stop; run texturr from another terminal.)")
+                os.execv(cmd[0], cmd)
+            print(serve_hint(path))
         else:
             print("Download one with: python3 texturr.py models --pull N")
         return 0
