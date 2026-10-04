@@ -1,0 +1,8 @@
+pandas
+openpyxl
+numpy
+tqdm
+scikit-learn
+sentence-transformers
+keybert
+pytest

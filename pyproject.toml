@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "texturr"
+version = "0.2.0"
+description = "Group and summarize free-form answers in spreadsheets, local-first."
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.9"
+dependencies = ["pandas", "openpyxl", "numpy", "scikit-learn", "sentence-transformers", "keybert", "tqdm"]
+
+[project.optional-dependencies]
+dev = ["pytest", "datasets"]
+
+[project.scripts]
+texturr = "texturr:main"
+
+[tool.setuptools]
+py-modules = ["texturr", "llm", "models", "clustering", "clean", "report", "session", "server"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

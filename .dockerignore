@@ -1,0 +1,9 @@
+.venv
+.git
+__pycache__
+*.pyc
+eval
+examples
+tests
+n8n/data
+.env
