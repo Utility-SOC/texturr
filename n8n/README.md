@@ -1,5 +1,10 @@
 # Agentic analysis with n8n
 
+> **Untested with a real language model.** The wiring is verified with real n8n, real MCP nodes and the real
+> texturr service, but every agent run so far used a scripted stand-in that follows a fixed plan. How a
+> real model decides what to merge, split and label has not been measured. Check its output on your own
+> data before relying on it. Details in [What has and has not been tested](#what-has-and-has-not-been-tested).
+
 An AI agent reviews texturr's automatic grouping, fixes it, names every group, and hands back your
 spreadsheet with the groups written beside each answer. Built in [n8n](https://n8n.io) so it can be
 inspected, edited and scheduled without writing code, and runs entirely on your own machine.

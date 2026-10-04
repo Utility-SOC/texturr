@@ -12,11 +12,15 @@ use a local model and labeling uses a local LLM server. Sending text to a hosted
 provider is possible but off unless you pass `--allow-remote`, and `--offline` forbids
 it outright.
 
-> **Current state (2026-10-03, version 0.3.0, all merged to `main`):** the full pipeline, the local
-> service, the n8n agent workflows and the Docker stack are built and verified with real components;
-> 83 tests pass in CI. **No real LLM has been run through it yet** (labeling and the n8n agent were
-> tested against stand-ins), so the quality of LLM labels and agent decisions is unmeasured. See
-> [Status and plans](#status-and-plans) for the full list.
+> **Current state (2026-10-03, version 0.3.0, merged to `main`).**
+>
+> **WARNING: everything that depends on a language model is untested.** When texturr was upgraded
+> from keyphrases-only to LLM labeling, hosted providers, model downloads and the n8n AI agent, no
+> real model was available to run any of it. That code is verified against stand-ins only: stub HTTP
+> servers and a scripted fake LLM. The grouping, the service, the Docker stack and the n8n wiring
+> are verified with real components. Whether real models label well, or make good merge decisions as
+> the agent, has not been measured. Treat LLM output as unvalidated until you have checked it on
+> your own data. The table in [Status and plans](#status-and-plans) shows exactly what has and has not been run.
 
 ## Install
 
@@ -306,6 +310,20 @@ itself when `sentence-transformers` is not installed. GitHub Actions runs the su
 ## Status and plans
 
 All work to date is merged to `main`; CI runs the tests on Python 3.9 to 3.12.
+
+**Testing status: what has actually been run.** "Real" means the real component, not a stand-in.
+
+| Feature | Tested with | Real language model? |
+| --- | --- | --- |
+| Embeddings, grouping, auto group count, keyphrases | Real models, benchmark (Banking77) | Not needed |
+| HTML report, annotated spreadsheet, non-answer handling | Real runs and tests | Not needed |
+| REST + MCP service, uploads, sessions, auth, limits | Real server, real embeddings, tests | Not needed |
+| n8n workflows (both), Docker stack, data-retention settings | Real n8n 2.41.6, real Agent and MCP nodes, real containers | **No: scripted fake LLM** |
+| **LLM cluster labels** (`--llm`, local or hosted) | Stub HTTP servers only | **No, never run** |
+| **n8n agent's merge, split, move and labeling decisions** | Scripted plan that always does the same thing | **No, never run** |
+| **Hosted providers** (Anthropic, OpenAI, Gemini, Mistral, Groq, OpenRouter) | Request format against stubs; default model names are from memory | **No, never run** |
+| **Model shortlist download** (`models --pull`, `--serve`) | Live Hub metadata and a stub server; no model has been downloaded | **No, never run** |
+| **Label-quality harness** with an LLM | Validated with stand-in labels; only the no-LLM baseline was measured | **No, never run** |
 
 **Built and verified with real components:**
 - The pipeline (embeddings, grouping, keyphrases, HTML report, annotated copy) and its grouping evaluation.
